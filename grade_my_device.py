@@ -100,6 +100,13 @@ def ask_permission():
         "It is READ-ONLY: nothing is moved, changed or deleted, and the data\n"
         "collected is erased from memory as soon as your report is printed.\n"
     )
+    if sys.platform == "darwin":
+        print("macOS note: for a complete scan, give your Terminal app Full Disk\n"
+              "Access (System Settings > Privacy & Security > Full Disk Access).\n"
+              "Without it, macOS may ask about some folders or hide them.\n")
+    elif os.name != "nt":
+        print("Linux note: folders your user can't read are counted as system\n"
+              "space. Nothing extra is needed to run it.\n")
     try:
         answer = input("Do you give permission? (y/n): ").strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -142,6 +149,7 @@ JUNK_MARKERS = (
     "/windows/temp/", "/windows/softwaredistribution/download/",
     "/inetcache/", "/crashdumps/", "/windows/minidump/", "/windows/logs/",
     "/library/logs/", "/library/caches/", "/tmp/", "/var/tmp/", "/.cache/",
+    "/private/var/folders/",
 )
 # Cache folders only count as junk in user data / AppData (browser and app
 # caches). Inside installed programs a "cache" folder can be real game data.
@@ -160,32 +168,111 @@ SYSTEM_MARKERS = (
 # listed on its own instead of as one giant "Steam" entry.
 PROGRAM_ROOTS = (
     "/steamapps/common/", "/program files/", "/program files (x86)/",
-    "/appdata/local/programs/", "/applications/", "/opt/",
+    "/appdata/local/programs/", "/applications/", "/opt/", "/flatpak/app/",
 )
-# Linux pseudo filesystems that must never be walked.
-SKIP_ROOTS = ("/proc", "/sys", "/dev", "/run")
+# Linux pseudo filesystems that must never be walked (exact paths).
+SKIP_ROOTS = {"/proc", "/sys", "/dev", "/run"}
 
 # Windows file attribute bits
 ATTR_REPARSE = 0x400
 ATTR_CLOUD = 0x1000 | 0x40000 | 0x400000  # offline / recall-on-open / recall-on-access
+# macOS: iCloud files that were moved off the Mac ("Optimize Mac Storage").
+SF_DATALESS = 0x40000000
+
+# On macOS (Catalina and newer) all user data lives on a separate "Data"
+# volume. Scanning it directly avoids counting the same files twice.
+MAC_DATA = "/System/Volumes/Data"
+
+# Linux filesystem types that live on real disks.
+REAL_FS = {
+    "ext2", "ext3", "ext4", "xfs", "btrfs", "f2fs", "jfs", "reiserfs", "zfs",
+    "bcachefs", "ntfs", "ntfs3", "fuseblk", "exfat", "vfat",
+}
 
 DUP_MIN_SIZE = 100 * 1024          # ignore tiny files for duplicate checks
 FULL_HASH_LIMIT = 256 * 1024 ** 2  # bigger files are compared by samples
 
 
-def fixed_drives():
-    """Return the root of every local fixed drive."""
+def read_text(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def linux_block_is_external(name):
+    """True if a Linux block device (e.g. 'sdb1') is removable or on USB."""
+    sys_path = os.path.realpath(f"/sys/class/block/{name}")
+    if "/usb" in sys_path:
+        return True
+    for folder in (sys_path, os.path.dirname(sys_path)):   # partition, then disk
+        if read_text(os.path.join(folder, "removable")) == "1":
+            return True
+    return False
+
+
+def linux_storage_targets(mounts_text):
+    """Group the real, internal Linux mounts by device.
+    Returns [(usage_path, [mount points])]."""
+    by_dev = {}
+    for line in mounts_text.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        dev, mnt, fs = parts[0], parts[1].replace("\\040", " "), parts[2]
+        if fs not in REAL_FS:
+            continue
+        if fs != "zfs" and (not dev.startswith("/dev/") or dev.startswith("/dev/loop")):
+            continue
+        if mnt.startswith(("/media/", "/run/media/", "/mnt/usb", "/boot")):
+            continue
+        if dev.startswith("/dev/") and linux_block_is_external(
+                os.path.basename(os.path.realpath(dev))):
+            continue
+        by_dev.setdefault(dev, [])
+        if mnt not in by_dev[dev]:
+            by_dev[dev].append(mnt)
+    targets = [(sorted(m, key=len)[0], sorted(m, key=len)) for m in by_dev.values()]
+    if not any("/" in roots for _, roots in targets):
+        targets.insert(0, ("/", ["/"]))
+    return targets
+
+
+def storage_targets():
+    """One entry per internal disk/filesystem: (usage_path, [folders to walk])."""
     if os.name == "nt":
         import ctypes
-        roots = []
+        targets = []
         mask = ctypes.windll.kernel32.GetLogicalDrives()
         for i, letter_ in enumerate(string.ascii_uppercase):
             if mask & (1 << i):
                 root = f"{letter_}:\\"
                 if ctypes.windll.kernel32.GetDriveTypeW(root) == 3:  # DRIVE_FIXED
-                    roots.append(root)
-        return roots or ["C:\\"]
-    return ["/"]
+                    targets.append((root, [root]))
+        return targets or [("C:\\", ["C:\\"])]
+    if sys.platform == "darwin":
+        return [("/", [MAC_DATA if os.path.isdir(MAC_DATA) else "/"])]
+    return linux_storage_targets(read_text("/proc/mounts"))
+
+
+def disk_usage(path):
+    """(total, used, free) in bytes."""
+    usage = shutil.disk_usage(path)
+    if sys.platform == "darwin":
+        # APFS shares space between volumes; "used" for "/" only covers the
+        # small system volume. The whole disk's use is total minus free.
+        return usage.total, usage.total - usage.free, usage.free
+    return usage.total, usage.used, usage.free
+
+
+def classify_path(path):
+    """Normalize a path for matching: '/' separators, and on macOS drop the
+    Data-volume prefix so '/System/Volumes/Data/Users/..' reads '/Users/..'."""
+    norm = path.replace("\\", "/")
+    if norm.startswith(MAC_DATA + "/"):
+        norm = norm[len(MAC_DATA):]
+    return norm
 
 
 def classify(path_lower, ext, user_area):
@@ -229,19 +316,25 @@ class StorageScan:
 
     # -- walking --
     def run(self):
-        for root in fixed_drives():
+        walk_roots = []
+        for usage_path, roots in storage_targets():
             try:
-                usage = shutil.disk_usage(root)
+                total, used, free = disk_usage(usage_path)
             except OSError:
                 continue
-            self.drives.append((root, usage.total, usage.used))
-            self.total += usage.total
-            self.used += usage.used
-            self.free += usage.free
+            self.drives.append((usage_path, total, used))
+            self.total += total
+            self.used += used
+            self.free += free
+            walk_roots += roots
 
         start = time.time()
         last = 0.0
-        for root, _, _ in self.drives:
+        for root in walk_roots:
+            try:
+                root_dev = os.stat(root).st_dev
+            except OSError:
+                continue
             stack = [root]
             while stack:
                 folder = stack.pop()
@@ -260,11 +353,16 @@ class StorageScan:
                         if entry.is_dir(follow_symlinks=False):
                             if attrs & ATTR_REPARSE:
                                 continue
-                            if os.name != "nt" and entry.path.startswith(SKIP_ROOTS):
+                            # Mac/Linux: stay on this disk (skips USB drives,
+                            # network shares, /proc, other mounted volumes).
+                            if os.name != "nt" and (st.st_dev != root_dev
+                                                    or entry.path in SKIP_ROOTS):
                                 continue
                             stack.append(entry.path)
                             continue
                         if not entry.is_file(follow_symlinks=False) or attrs & ATTR_CLOUD:
+                            continue
+                        if getattr(st, "st_flags", 0) & SF_DATALESS:
                             continue
                         self._add_file(entry.path, st.st_size)
                     except OSError:
@@ -281,12 +379,13 @@ class StorageScan:
 
     def _add_file(self, path, size):
         self.files += 1
-        p = path.replace("\\", "/").lower()
+        norm = classify_path(path)
+        p = norm.lower()
         ext = os.path.splitext(p)[1]
         user_area = not any(m in p for m in SYSTEM_MARKERS)
         cat = classify(p, ext, user_area)
         self.sizes[cat] += size
-        self._add_program(path, p, size)
+        self._add_program(norm, p, size)
         if cat == "junk":
             self.junk_only += size
             self.junk_places[self._junk_label(p)] = \
@@ -310,6 +409,8 @@ class StorageScan:
                 orig = path.replace("\\", "/")
                 name = orig[i + len(root):].split("/", 1)[0] \
                     if len(orig) == len(p) else folder
+                if name.lower().endswith(".app"):      # macOS "Xcode.app"
+                    name = name[:-4]
                 self.programs[key] = [name, 0]
             self.programs[key][1] += size
             return
@@ -322,6 +423,7 @@ class StorageScan:
         for label, marker in (
             ("Recycle Bin / Trash", "$recycle.bin"), ("Recycle Bin / Trash", "trash/"),
             ("Temporary files", "/temp/"), ("Temporary files", "/tmp/"),
+            ("Temporary files", "/var/folders/"),
             ("Windows Update leftovers", "softwaredistribution"),
             ("App & browser caches", "cache"), ("Crash dumps & logs", "dump"),
             ("Crash dumps & logs", "/logs/"),
@@ -452,6 +554,28 @@ def grade_storage(scan):
     return max(score, 0), reasons, used_pct, clutter_pct
 
 
+if os.name == "nt":
+    CLEANUP_HOWTO = {
+        "junk": "'Disk Cleanup' or Settings > System > Storage > Temporary files "
+                "does this safely.",
+        "apps": "Use Settings > Apps > Installed apps to remove programs safely",
+    }
+elif sys.platform == "darwin":
+    CLEANUP_HOWTO = {
+        "junk": "Empty the Trash, and use System Settings > General > Storage "
+                "to review and remove clutter safely.",
+        "apps": "Drag unused apps from Applications to the Trash, or use "
+                "System Settings > General > Storage > Applications",
+    }
+else:
+    CLEANUP_HOWTO = {
+        "junk": "Empty the Trash and clear ~/.cache, or use your distro's "
+                "disk cleanup tool (e.g. 'sudo apt autoremove && sudo apt clean').",
+        "apps": "Remove unused programs with your package manager or software "
+                "center",
+    }
+
+
 def print_storage_report(scan):
     header("PART 1 - STORAGE USAGE")
     draw_storage_bar(scan)
@@ -477,8 +601,7 @@ def print_storage_report(scan):
         places = sorted(scan.junk_places.items(), key=lambda x: -x[1])[:4]
         tips.append(f"Clear about {fmt_bytes(scan.junk_only)} of junk: " + ", ".join(
             f"{name} ({fmt_bytes(b)})" for name, b in places)
-            + ". On Windows, 'Disk Cleanup' or Settings > System > Storage >"
-              " Temporary files does this safely.")
+            + ". " + CLEANUP_HOWTO["junk"])
     if scan.dup_bytes > 200 * 1024 ** 2:
         tips.append(f"{fmt_bytes(scan.dup_bytes)} is taken by duplicate copies "
                     f"({len(scan.dup_groups)} sets). Biggest ones:")
@@ -495,7 +618,7 @@ def print_storage_report(scan):
                "less than 10-15% free. Uninstall programs you don't use")
         if top:
             tip += (f" - your biggest is {top[0][0]} ({fmt_bytes(top[0][1])}). "
-                    "Use Settings > Apps > Installed apps to remove programs safely")
+                    + CLEANUP_HOWTO["apps"])
         tips.append(tip + ".")
     if g in ("A", "B") and not tips:
         tips.append("Good job! Your storage is healthy, with plenty of free space "
@@ -547,7 +670,7 @@ def collect_hardware():
         "is_laptop": False, "screen_in": None, "resolution": None,
         "cpu": "Unknown CPU", "cores": 0, "threads": 0, "ram_gb": 0.0,
         "storage_gb": 0.0, "storage_type": "Unknown", "gpu": "",
-        "battery": False, "os": platform.platform(),
+        "battery": False, "os": platform.platform(), "os_family": "windows",
     }
     if os.name == "nt":
         cs = (powershell_json("Get-CimInstance Win32_ComputerSystem | Select Manufacturer,"
@@ -606,45 +729,171 @@ def collect_hardware():
             hw["os"] = f"{osinfo['Caption'].strip()} (build {osinfo.get('BuildNumber')})"
 
     elif sys.platform == "darwin":
-        hw["maker"] = "Apple"
-        hw["model"] = run_text(["sysctl", "-n", "hw.model"]).strip()
-        hw["cpu"] = run_text(["sysctl", "-n", "machdep.cpu.brand_string"]).strip() or hw["cpu"]
-        hw["cores"] = int(run_text(["sysctl", "-n", "hw.physicalcpu"]).strip() or 0)
-        hw["threads"] = int(run_text(["sysctl", "-n", "hw.logicalcpu"]).strip() or 0)
-        hw["ram_gb"] = int(run_text(["sysctl", "-n", "hw.memsize"]).strip() or 0) / 1024 ** 3
-        hw["storage_gb"] = shutil.disk_usage("/").total / 1000 ** 3
-        hw["storage_type"] = "SSD"
-        hw["is_laptop"] = "book" in hw["model"].lower()
-        hw["type"] = "Laptop" if hw["is_laptop"] else "Desktop"
-        hw["battery"] = hw["is_laptop"]
-        hw["os"] = "macOS " + platform.mac_ver()[0]
-
-    else:  # Linux
-        def read(p):
-            try:
-                with open(p) as f:
-                    return f.read().strip()
-            except OSError:
-                return ""
-        hw["maker"] = read("/sys/class/dmi/id/sys_vendor")
-        hw["model"] = read("/sys/class/dmi/id/product_name")
-        hw["family"] = read("/sys/class/dmi/id/product_version")
-        ctype = read("/sys/class/dmi/id/chassis_type")
-        if ctype.isdigit():
-            hw["type"] = CHASSIS.get(int(ctype), "Unknown")
-            hw["is_laptop"] = int(ctype) in (8, 9, 10, 14, 30, 31, 32)
-        info = read("/proc/cpuinfo")
-        m = re.search(r"model name\s*:\s*(.+)", info)
-        hw["cpu"] = m.group(1) if m else hw["cpu"]
-        hw["threads"] = os.cpu_count() or 0
-        cores = {(a, b) for a, b in re.findall(
-            r"physical id\s*:\s*(\d+).*?core id\s*:\s*(\d+)", info, re.S)}
-        hw["cores"] = len(cores) or hw["threads"]
-        m = re.search(r"MemTotal:\s*(\d+)", read("/proc/meminfo"))
-        hw["ram_gb"] = int(m.group(1)) / 1024 ** 2 if m else 0
-        hw["storage_gb"] = shutil.disk_usage("/").total / 1000 ** 3
-        hw["battery"] = os.path.isdir("/sys/class/power_supply/BAT0")
+        collect_mac(hw)
+    else:
+        collect_linux(hw)
     return hw
+
+
+def sysctl(name):
+    return run_text(["sysctl", "-n", name]).strip()
+
+
+def apply_mac_profile(hw, profile):
+    """Fill hw from `system_profiler SPHardwareDataType SPDisplaysDataType -json`."""
+    info = (profile.get("SPHardwareDataType") or [{}])[0]
+    machine = info.get("machine_name", "")            # e.g. "MacBook Air"
+    hw["family"] = machine
+    hw["model"] = info.get("machine_model") or info.get("model_number") or hw["model"]
+    chip = info.get("chip_type") or info.get("cpu_type")
+    if chip and hw["cpu"] == "Unknown CPU":
+        hw["cpu"] = chip
+    m = machine.lower()
+    if "book" in m:
+        hw["type"], hw["is_laptop"] = "Laptop", True
+    elif "imac" in m:
+        hw["type"] = "All-in-one desktop"
+    elif "mini" in m:
+        hw["type"] = "Mini PC"
+    elif m:
+        hw["type"] = "Desktop"
+    gpus, internal_res, any_res = [], None, None
+    for gpu in profile.get("SPDisplaysDataType") or []:
+        if gpu.get("sppci_model"):
+            gpus.append(gpu["sppci_model"])
+        for disp in gpu.get("spdisplays_ndrvs") or []:
+            px = re.search(r"(\d+)\s*x\s*(\d+)", disp.get("_spdisplays_pixels")
+                           or disp.get("_spdisplays_resolution") or "")
+            if not px:
+                continue
+            res = (int(px.group(1)), int(px.group(2)))
+            any_res = any_res or res
+            if "internal" in str(disp.get("spdisplays_connection_type", "")):
+                internal_res = res
+    hw["gpu"] = ", ".join(gpus)
+    hw["resolution"] = internal_res or any_res
+
+
+def collect_mac(hw):
+    hw["maker"] = "Apple"
+    hw["model"] = sysctl("hw.model")
+    hw["cpu"] = sysctl("machdep.cpu.brand_string") or hw["cpu"]   # "Apple M2"
+    hw["cores"] = int(sysctl("hw.physicalcpu") or 0)
+    hw["threads"] = int(sysctl("hw.logicalcpu") or 0)
+    hw["ram_gb"] = int(sysctl("hw.memsize") or 0) / 1024 ** 3
+    try:
+        apply_mac_profile(hw, json.loads(run_text(
+            ["system_profiler", "SPHardwareDataType", "SPDisplaysDataType", "-json"])
+            or "{}"))
+    except ValueError:
+        pass
+    hw["storage_gb"] = shutil.disk_usage("/").total / 1000 ** 3
+    disk = run_text(["diskutil", "info", "/"])
+    solid = re.search(r"Solid State:\s*(\w+)", disk)
+    proto = re.search(r"Protocol:\s*(.+)", disk)
+    if solid and solid.group(1) == "No":
+        hw["storage_type"] = "Hard drive (HDD)"
+    elif proto and re.search(r"Apple Fabric|PCI|NVMe", proto.group(1)):
+        hw["storage_type"] = "NVMe SSD"
+    else:
+        hw["storage_type"] = "SSD"
+    hw["battery"] = "InternalBattery" in run_text(["pmset", "-g", "batt"])
+    hw["os"] = "macOS " + platform.mac_ver()[0]
+    hw["os_family"] = "macos"
+
+
+def linux_core_count(cpuinfo):
+    """Physical cores from /proc/cpuinfo (one block per logical CPU)."""
+    pairs, blocks = set(), [b for b in cpuinfo.split("\n\n") if b.strip()]
+    for block in blocks:
+        phys = re.search(r"^physical id\s*:\s*(\d+)", block, re.M)
+        core = re.search(r"^core id\s*:\s*(\d+)", block, re.M)
+        if phys and core:
+            pairs.add((phys.group(1), core.group(1)))
+    return len(pairs) or len([b for b in blocks if re.search(r"^processor", b, re.M)])
+
+
+def edid_diagonal_inches(edid):
+    """Screen diagonal from EDID bytes 21-22 (width/height in cm)."""
+    if len(edid) < 23 or not edid[21] or not edid[22]:
+        return None
+    return round((edid[21] ** 2 + edid[22] ** 2) ** 0.5 / 2.54, 1)
+
+
+def collect_linux(hw):
+    dmi = "/sys/class/dmi/id/"
+    hw["maker"] = read_text(dmi + "sys_vendor").title()
+    hw["model"] = read_text(dmi + "product_name")
+    version = read_text(dmi + "product_version")
+    hw["family"] = version if version.lower() not in ("", "none", "1.0",
+                                                      "to be filled by o.e.m.") else ""
+    ctype = read_text(dmi + "chassis_type")
+    if ctype.isdigit():
+        hw["type"] = CHASSIS.get(int(ctype), "Unknown")
+        hw["is_laptop"] = int(ctype) in (8, 9, 10, 14, 30, 31, 32)
+
+    info = read_text("/proc/cpuinfo")
+    m = re.search(r"^(model name|Model|Hardware)\s*:\s*(.+)$", info, re.M)
+    hw["cpu"] = m.group(2).strip() if m else (platform.processor() or hw["cpu"])
+    hw["threads"] = os.cpu_count() or 0
+    hw["cores"] = linux_core_count(info) or hw["threads"]
+    m = re.search(r"MemTotal:\s*(\d+)", read_text("/proc/meminfo"))
+    hw["ram_gb"] = int(m.group(1)) / 1024 ** 2 if m else 0
+
+    # Internal disks: skip virtual, optical, removable and USB devices.
+    total, kinds = 0, set()
+    try:
+        devices = os.listdir("/sys/block")
+    except OSError:
+        devices = []
+    for dev in devices:
+        if dev.startswith(("loop", "ram", "zram", "dm-", "md", "sr", "fd", "nbd")):
+            continue
+        if linux_block_is_external(dev):
+            continue
+        size = read_text(f"/sys/block/{dev}/size")
+        if not size.isdigit() or int(size) == 0:
+            continue
+        total += int(size) * 512
+        if dev.startswith("nvme"):
+            kinds.add("NVMe SSD")
+        elif read_text(f"/sys/block/{dev}/queue/rotational") == "1":
+            kinds.add("Hard drive (HDD)")
+        else:
+            kinds.add("SSD")
+    hw["storage_gb"] = (total or shutil.disk_usage("/").total) / 1000 ** 3
+    for kind in ("Hard drive (HDD)", "SSD", "NVMe SSD"):   # report the slowest
+        if kind in kinds:
+            hw["storage_type"] = kind
+            break
+
+    # Screen: prefer the built-in panel (eDP/LVDS/DSI).
+    import glob
+    outputs = sorted(glob.glob("/sys/class/drm/card*-*"),
+                     key=lambda p: not re.search(r"eDP|LVDS|DSI", p))
+    for out in outputs:
+        if read_text(out + "/status") != "connected":
+            continue
+        try:
+            with open(out + "/edid", "rb") as f:
+                hw["screen_in"] = edid_diagonal_inches(f.read())
+        except OSError:
+            pass
+        mode = re.match(r"(\d+)x(\d+)", read_text(out + "/modes"))
+        if mode:
+            hw["resolution"] = (int(mode.group(1)), int(mode.group(2)))
+        break
+    vendors = {"0x8086": "Intel", "0x10de": "NVIDIA", "0x1002": "AMD"}
+    gpus = {vendors.get(read_text(c + "/device/vendor"), "")
+            for c in glob.glob("/sys/class/drm/card[0-9]")}
+    hw["gpu"] = ", ".join(sorted(f"{g} graphics" for g in gpus if g))
+
+    hw["battery"] = bool(glob.glob("/sys/class/power_supply/BAT*"))
+    try:
+        hw["os"] = platform.freedesktop_os_release().get("PRETTY_NAME", "Linux")
+    except (AttributeError, OSError):
+        hw["os"] = "Linux " + platform.release()
+    hw["os_family"] = "linux"
 
 
 def cpu_tier(name):
@@ -714,12 +963,25 @@ def estimate_price(hw):
 OFFICE_MIN = {"ram": 8, "storage": 256, "cores": 4}
 COLLEGE_REC = {"ram": 16, "storage": 512, "cores": 4}
 
+STANDARD_RAM = (1, 2, 3, 4, 6, 8, 12, 16, 18, 24, 32, 36, 48, 64, 96, 128, 192, 256)
+
+
+def installed_ram(hw):
+    """The OS reports a bit less RAM than is installed (the kernel and built-in
+    graphics reserve some), e.g. 15.4 GB on a 16 GB laptop. Snap up to the
+    nearest standard size."""
+    usable = hw["ram_gb"]
+    for size in STANDARD_RAM:
+        if size >= usable - 0.05:
+            return size
+    return round(usable)
+
 
 def grade_hardware(hw):
     """100 points: RAM 25, CPU 25, storage size 20, storage type 10, OS 10,
     display 10. Compared against what a college student / office worker needs."""
     pts = {}
-    ram = round(hw["ram_gb"])
+    ram = installed_ram(hw)
     pts["RAM"] = (25 if ram >= 16 else 18 if ram >= 8 else 8 if ram >= 4 else 0, 25)
 
     c = hw["cores"]
@@ -734,8 +996,14 @@ def grade_hardware(hw):
     pts["Storage type"] = (10 if "NVMe" in st else 9 if "SSD" in st else 3 if "HDD" in st
                            else 6, 10)
 
-    os_name = hw["os"].lower()
-    if "windows 11" in os_name or "macos" in os_name or "linux" in os_name:
+    os_name, family = hw["os"].lower(), hw.get("os_family", "windows")
+    if family == "linux":
+        pts["Operating system"] = (10, 10)
+    elif family == "macos":
+        m = re.search(r"macos (\d+)", os_name)
+        # Apple only keeps the newest few macOS versions patched.
+        pts["Operating system"] = (10 if not m or int(m.group(1)) >= 14 else 5, 10)
+    elif "windows 11" in os_name:
         pts["Operating system"] = (10, 10)
     elif "windows 10" in os_name:
         pts["Operating system"] = (5, 10)     # support ended Oct 2025
@@ -759,10 +1027,14 @@ def grade_hardware(hw):
 
 def print_device_report(hw):
     header("PART 2 - DEVICE REPORT")
-    family = hw["family"]
-    if hw["maker"] and family.lower().startswith(hw["maker"].lower()):
-        family = family[len(hw["maker"]):].strip()   # avoid "Lenovo Lenovo ..."
-    name = " ".join(x for x in (hw["maker"], family) if x) or "Unknown device"
+    maker = re.sub(r",?\s+(inc\.?|corporation|corp\.?|co\.?,? ltd\.?)$", "",
+                   hw["maker"], flags=re.I)          # "Dell Inc." -> "Dell"
+    # Lenovo puts the friendly name in "family" and a code in "model"; Dell/HP
+    # put the friendly name in "model". Use whichever is readable.
+    family = hw["family"] or hw["model"]
+    if maker and family.lower().startswith(maker.lower()):
+        family = family[len(maker):].strip()   # avoid "Lenovo Lenovo ..."
+    name = " ".join(x for x in (maker, family) if x) or "Unknown device"
     print(f"\n  {BOLD}Device:{RESET} {name}")
     print(f"  {BOLD}Model: {RESET} {hw['model'] or 'Unknown'}")
 
@@ -781,7 +1053,8 @@ def print_device_report(hw):
     print(f"\n  {BOLD}Hardware{RESET}")
     print(f"    Processor ....... {hw['cpu']} ({hw['cores']} cores / "
           f"{hw['threads']} threads)")
-    print(f"    RAM ............. {hw['ram_gb']:.1f} GB usable")
+    print(f"    RAM ............. {installed_ram(hw)} GB installed "
+          f"({hw['ram_gb']:.1f} GB usable)")
     print(f"    Storage ......... {hw['storage_gb']:.0f} GB {hw['storage_type']}")
     if hw["gpu"]:
         print(f"    Graphics ........ {hw['gpu']}")
@@ -795,8 +1068,9 @@ def print_device_report(hw):
         cpu_tier(hw["cpu"])]
 
     print(f"\n  {BOLD}Summary{RESET}")
-    print(f"    Your {name} is a {hw['type'].lower()} with a {tier_name} "
-          f"processor, {round(hw['ram_gb'])} GB of RAM and a "
+    article = "an" if tier_name[0] in "aeiou" else "a"
+    print(f"    Your {name} is a {hw['type'].lower()} with {article} {tier_name} "
+          f"processor, {installed_ram(hw)} GB of RAM and a "
           f"{hw['storage_gb']:.0f} GB {hw['storage_type']}.")
     print(f"    Office-job standard (8 GB RAM, 256 GB SSD, 4+ cores): "
           f"{'MEETS' if office else 'DOES NOT MEET'}")
@@ -809,13 +1083,18 @@ def print_device_report(hw):
 
     print(f"\n  {BOLD}Should you upgrade?{RESET}")
     advice = []
-    ram = round(hw["ram_gb"])
+    ram = installed_ram(hw)
     if ram < 8:
         advice.append("RAM is below the 8 GB minimum - add memory if your model "
                       "allows it, otherwise this device should be replaced.")
     elif ram < 16:
-        advice.append("16 GB of RAM is recommended for college work with many "
-                      "browser tabs and apps open - upgrade if your RAM is not soldered.")
+        if hw.get("os_family") == "macos":
+            advice.append("16 GB of RAM is recommended for college work. Mac RAM "
+                          "can't be upgraded, so choose 16 GB+ for your next Mac.")
+        else:
+            advice.append("16 GB of RAM is recommended for college work with many "
+                          "browser tabs and apps open - upgrade if your RAM is not "
+                          "soldered.")
     if "HDD" in hw["storage_type"]:
         advice.append("Swap the hard drive for an SSD - it is the single biggest "
                       "speed boost for an older computer.")
@@ -829,6 +1108,9 @@ def print_device_report(hw):
     if "windows 10" in hw["os"].lower():
         advice.append("Windows 10 no longer receives security updates - upgrade to "
                       "Windows 11 if your hardware supports it.")
+    if hw.get("os_family") == "macos" and pts["Operating system"][0] < 10:
+        advice.append("This macOS version no longer gets full security updates - "
+                      "update macOS if your Mac supports it.")
 
     if g in ("A", "B") and not advice:
         print("    No upgrade needed. This device comfortably handles college and "

@@ -3,7 +3,8 @@ This is the third of three projects for my CSC 299 Ai lab final project. This pr
 
 ## How to run
 
-Requires Python 3.8+ (standard library only, no installs needed).
+Works on **Windows 10/11, macOS and Linux**. Requires Python 3.8+ (standard library only, no installs needed).
+On Mac/Linux use `python3 grade_my_device.py`.
 
 ```
 python grade_my_device.py
@@ -25,3 +26,9 @@ Answer `y` and it scans every local drive (read-only) and your hardware, then pr
 ### Notes
 - Weight and price aren't stored by the operating system, so they're estimated from the device type, screen size and parts.
 - A full scan takes about 1–2 minutes on a typical 512 GB drive.
+- **macOS:** for a complete scan, give your Terminal app Full Disk Access
+  (System Settings > Privacy & Security > Full Disk Access). Only the Mac's internal
+  disk is scanned, and iCloud files that aren't downloaded are skipped.
+- **Linux:** runs as a normal user. Only internal disks are scanned (USB drives,
+  network shares and snap images are skipped); folders you can't read count as system space.
+- Tested on Windows 11. The macOS and Linux code paths are tested with simulated system data.
