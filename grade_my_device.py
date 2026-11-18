@@ -155,6 +155,13 @@ SYSTEM_MARKERS = (
     "/bin/", "/sbin/", "/lib/", "/lib64/", "/opt/", "/var/", "/etc/", "/boot/",
     "/snap/", "/private/",
 )
+# Folders that hold installed programs. Each folder directly inside one of
+# these counts as one program. Steam games are checked first so each game is
+# listed on its own instead of as one giant "Steam" entry.
+PROGRAM_ROOTS = (
+    "/steamapps/common/", "/program files/", "/program files (x86)/",
+    "/appdata/local/programs/", "/applications/", "/opt/",
+)
 # Linux pseudo filesystems that must never be walked.
 SKIP_ROOTS = ("/proc", "/sys", "/dev", "/run")
 
@@ -215,6 +222,7 @@ class StorageScan:
         self.dup_bytes = 0
         self.dup_groups = []       # (wasted_bytes, count, example_path)
         self.junk_places = {}      # folder label -> bytes
+        self.programs = {}         # program folder (lowercase) -> [name, bytes]
         self.files = 0
         self.skipped = 0
         self._by_size = {}         # size -> [(path, category)]
@@ -278,12 +286,36 @@ class StorageScan:
         user_area = not any(m in p for m in SYSTEM_MARKERS)
         cat = classify(p, ext, user_area)
         self.sizes[cat] += size
+        self._add_program(path, p, size)
         if cat == "junk":
             self.junk_only += size
             self.junk_places[self._junk_label(p)] = \
                 self.junk_places.get(self._junk_label(p), 0) + size
         elif user_area and size >= DUP_MIN_SIZE:
             self._by_size.setdefault(size, []).append((path, cat))
+
+    def _add_program(self, path, p, size):
+        """Add a file's size to the installed program whose folder holds it."""
+        for root in PROGRAM_ROOTS:
+            i = p.find(root)
+            if i < 0:
+                continue
+            rest = p[i + len(root):]
+            if "/" not in rest:            # loose file, not inside a program folder
+                return
+            folder = rest.split("/", 1)[0]
+            key = p[:i + len(root)] + folder
+            if key not in self.programs:
+                # Take the display name from the original path (keeps capitals).
+                orig = path.replace("\\", "/")
+                name = orig[i + len(root):].split("/", 1)[0] \
+                    if len(orig) == len(p) else folder
+                self.programs[key] = [name, 0]
+            self.programs[key][1] += size
+            return
+
+    def top_programs(self, n=5):
+        return sorted(self.programs.values(), key=lambda x: -x[1])[:n]
 
     @staticmethod
     def _junk_label(p):
@@ -423,6 +455,13 @@ def grade_storage(scan):
 def print_storage_report(scan):
     header("PART 1 - STORAGE USAGE")
     draw_storage_bar(scan)
+    top = scan.top_programs(5)
+    if top:
+        print(f"\n  {BOLD}Biggest installed programs{RESET} "
+              f"{DIM}(part of the blue section){RESET}")
+        for i, (name, size) in enumerate(top, 1):
+            share = size / (scan.used or 1) * 100
+            print(f"    {i}. {name[:40]:<40}{fmt_bytes(size):>10}  {share:5.1f}% of used")
     score, reasons, used_pct, clutter_pct = grade_storage(scan)
     g = letter(score)
     print(f"\n  {BOLD}Storage grade: {g}  ({score}/100){RESET}")
@@ -452,8 +491,12 @@ def print_storage_report(scan):
         tips.append("Your Downloads/installers/music take a lot of room - delete "
                     "installers you have already run and old downloads.")
     if used_pct > 80:
-        tips.append("Your drive is nearly full; computers slow down when they have "
-                    "less than 10-15% free. Uninstall programs you don't use.")
+        tip = ("Your drive is nearly full; computers slow down when they have "
+               "less than 10-15% free. Uninstall programs you don't use")
+        if top:
+            tip += (f" - your biggest is {top[0][0]} ({fmt_bytes(top[0][1])}). "
+                    "Use Settings > Apps > Installed apps to remove programs safely")
+        tips.append(tip + ".")
     if g in ("A", "B") and not tips:
         tips.append("Good job! Your storage is healthy, with plenty of free space "
                     "and very little clutter. Keep it up.")
