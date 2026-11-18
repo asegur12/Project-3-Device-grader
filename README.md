@@ -1,2 +1,27 @@
 # Project-3-Device-grader
 This is the third of three projects for my CSC 299 Ai lab final project. This program is one that takes in the storage and hardware data from the device your using, and creates a grade based of that data
+
+## How to run
+
+Requires Python 3.8+ (standard library only, no installs needed).
+
+```
+python grade_my_device.py
+```
+
+The program asks for permission first. Answer `n` and it closes without scanning anything.
+Answer `y` and it scans every local drive (read-only) and your hardware, then prints:
+
+1. **Storage usage**: a colored bar of used vs. total space, split into
+   red (images/videos), orange (documents/PDFs), yellow (downloads/apps/installers/music),
+   blue (system/programs/other) and pink (duplicate and junk files), plus a storage grade and next steps.
+2. **Device report**: device name and model, type/size/weight, CPU/RAM/storage/price,
+   a summary, a grade against college and office-job standards, and upgrade advice.
+
+### Safety
+- Read-only: nothing is moved, changed or deleted.
+- Nothing is written to disk or sent anywhere. Collected data is erased from memory once the report is printed.
+
+### Notes
+- Weight and price aren't stored by the operating system, so they're estimated from the device type, screen size and parts.
+- A full scan takes about 1–2 minutes on a typical 512 GB drive.
